@@ -23,6 +23,7 @@ export interface HeroDef {
   name: string;
   title: string;
   avatarColor: string;
+  portraitUrl: string;
   startingWeapon: WeaponId;
   baseMaxHp: number;
   baseSpeed: number;
@@ -151,6 +152,17 @@ export interface DamageNumber {
   maxLife: number;
 }
 
+export interface LightPulse {
+  x: number;
+  y: number;
+  radius: number;
+  maxRadius: number;
+  color: string;
+  intensity: number;
+  life: number;
+  maxLife: number;
+}
+
 export interface GameRunStats {
   survivedTimeSeconds: number;
   totalKills: number;
@@ -161,4 +173,53 @@ export interface GameRunStats {
   passivesUsed: { id: PassiveId; level: number }[];
   score: number;
   isVictory: boolean;
+  missionsCompletedThisRun?: string[];
+  bonusXpEarnedThisRun?: number;
 }
+
+export type MissionMetric =
+  | 'kills'
+  | 'survive_seconds'
+  | 'gems_collected'
+  | 'dashes_used'
+  | 'specials_used'
+  | 'boss_kills'
+  | 'reach_level';
+
+export type ExclusiveRelicId =
+  | 'chrono_core'
+  | 'vampiric_siphon'
+  | 'quantum_attractor'
+  | 'aegis_matrix';
+
+export interface ExclusiveRelicDef {
+  id: ExclusiveRelicId;
+  name: string;
+  description: string;
+  effectSummary: string;
+  accentColor: string;
+  requiredMissionsCompleted: number;
+}
+
+export interface DailyMission {
+  id: string;
+  title: string;
+  description: string;
+  metric: MissionMetric;
+  target: number;
+  progress: number;
+  completed: boolean;
+  rewardXp: number;
+  rewardShards: number;
+  unlockRelicId?: ExclusiveRelicId;
+}
+
+export interface PlayerProgression {
+  dateKey: string;
+  missions: DailyMission[];
+  totalMissionsCompleted: number;
+  vanguardShards: number;
+  unlockedRelics: ExclusiveRelicId[];
+  equippedRelic: ExclusiveRelicId | null;
+}
+

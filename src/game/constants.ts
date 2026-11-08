@@ -1,11 +1,14 @@
 import { HeroDef, HeroId, PassiveId, WeaponId } from './types.ts';
 
+export const ARENA_BACKDROP_URL = '/src/assets/images/hero_arena_backdrop_1794110368757.jpg';
+
 export const HEROES: Record<HeroId, HeroDef> = {
   vance: {
     id: 'vance',
     name: 'Striker Vance',
     title: 'Vanguard Ranger',
     avatarColor: '#06b6d4', // cyan-500
+    portraitUrl: '/src/assets/images/portrait_hero_vance_1794110371088.jpg',
     startingWeapon: 'pulse_carbine',
     baseMaxHp: 100,
     baseSpeed: 210,
@@ -19,6 +22,7 @@ export const HEROES: Record<HeroId, HeroDef> = {
     name: 'Nova Ray',
     title: 'Void Sorceress',
     avatarColor: '#a855f7', // purple-500
+    portraitUrl: '/src/assets/images/portrait_hero_nova_1794110373221.jpg',
     startingWeapon: 'orbital_blades',
     baseMaxHp: 85,
     baseSpeed: 195,
@@ -32,6 +36,7 @@ export const HEROES: Record<HeroId, HeroDef> = {
     name: 'Titan Rex',
     title: 'Armored Juggernaut',
     avatarColor: '#f59e0b', // amber-500
+    portraitUrl: '/src/assets/images/portrait_hero_titan_1794110372884.jpg',
     startingWeapon: 'tesla_coil',
     baseMaxHp: 160,
     baseSpeed: 175,
@@ -45,6 +50,7 @@ export const HEROES: Record<HeroId, HeroDef> = {
     name: 'Kage Shinobi',
     title: 'Cyber Assassin',
     avatarColor: '#10b981', // emerald-500
+    portraitUrl: '/src/assets/images/portrait_hero_kage_1794110372946.jpg',
     startingWeapon: 'seeker_missiles',
     baseMaxHp: 90,
     baseSpeed: 230,

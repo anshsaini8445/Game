@@ -1,12 +1,18 @@
 import { sound } from './audio.ts';
 import { ALL_UPGRADES, HEROES, MAP_SIZE, VICTORY_TIME_SECONDS } from './constants.ts';
+import { loadProgression, updateMissionProgress } from './missions.ts';
 import {
+  DailyMission,
   DamageNumber,
   Enemy,
+  ExclusiveRelicDef,
+  ExclusiveRelicId,
   GameRunStats,
   Gem,
   HeroDef,
   HeroId,
+  LightPulse,
+  MissionMetric,
   PassiveId,
   Particle,
   PlayerStats,
@@ -20,6 +26,7 @@ export interface EngineCallbacks {
   onLevelUp: (options: UpgradeOption[]) => void;
   onGameOver: (stats: GameRunStats) => void;
   onVictory: (stats: GameRunStats) => void;
+  onMissionComplete?: (mission: DailyMission, unlockedRelics: ExclusiveRelicDef[]) => void;
   onStatsUpdate: (stats: {
     hp: number;
     maxHp: number;
@@ -33,6 +40,10 @@ export interface EngineCallbacks {
     dashReady: boolean;
     dashCooldownProgress: number;
     boss?: { name: string; hp: number; maxHp: number };
+    missions: DailyMission[];
+    equippedRelic: ExclusiveRelicId | null;
+    threatMultiplier: number;
+    threatTier: string;
   }) => void;
 }
 
@@ -47,14 +58,34 @@ export class GameEngine {
   private animationFrameId: number | null = null;
   private lastTime: number = 0;
 
-  // Hitstop & Camera shake
+  // Hitstop, Camera Shake & Chromatic Aberration
   private hitstopTimer: number = 0;
   private cameraShakeIntensity: number = 0;
+  private cameraShakeAngle: number = 0;
+  private chromaticAberration: number = 0;
+  private combatAdrenaline: number = 0;
   private cameraX: number = 0;
   private cameraY: number = 0;
+  private shockwaves: {
+    x: number;
+    y: number;
+    radius: number;
+    maxRadius: number;
+    color: string;
+    alpha: number;
+    lineWidth: number;
+  }[] = [];
 
-  // Selected hero
+  // Selected hero & equipped relic
   public hero: HeroDef;
+  public equippedRelic: ExclusiveRelicId | null = null;
+  private xpGainMultiplier: number = 1.0;
+
+  // Daily mission tracking within run
+  private currentMissions: DailyMission[] = [];
+  private missionsCompletedThisRun: string[] = [];
+  private bonusXpEarnedThisRun: number = 0;
+  private lastTrackedSecond: number = 0;
 
   // Player position & state
   public playerX: number = 0;
@@ -81,12 +112,16 @@ export class GameEngine {
   public gems: Gem[] = [];
   public particles: Particle[] = [];
   public damageNumbers: DamageNumber[] = [];
+  public lightPulses: LightPulse[] = [];
 
-  // Spawners & Encounter Progression
+  // Spawners & Adaptive Encounter Progression
   public elapsedTime: number = 0;
   public totalKills: number = 0;
   public totalDamageDealt: number = 0;
+  public threatMultiplier: number = 1.0;
+  public threatTier: string = 'LOW';
   private enemySpawnTimer: number = 0;
+  private swarmSurgeCooldown: number = 22;
   private nextEnemyId: number = 1;
   private nextProjId: number = 1;
   private nextGemId: number = 1;
@@ -111,6 +146,10 @@ export class GameEngine {
     this.ctx = canvas.getContext('2d')!;
     this.callbacks = callbacks;
     this.hero = HEROES[heroId] || HEROES.vance;
+
+    const prog = loadProgression();
+    this.currentMissions = prog.missions;
+    this.equippedRelic = prog.equippedRelic;
 
     // Initialize player stats based on hero
     this.playerStats = {
@@ -142,12 +181,62 @@ export class GameEngine {
       this.playerStats.critChance += 0.25;
     }
 
+    // Apply Exclusive Relic bonuses
+    if (this.equippedRelic === 'chrono_core') {
+      this.playerStats.attackSpeedMultiplier *= 1.2;
+      this.dashMaxCooldown *= 0.75;
+    } else if (this.equippedRelic === 'vampiric_siphon') {
+      this.playerStats.maxHp += 30;
+      this.playerStats.hp += 30;
+    } else if (this.equippedRelic === 'quantum_attractor') {
+      this.playerStats.magnetRadius *= 1.8;
+      this.xpGainMultiplier = 1.25;
+    } else if (this.equippedRelic === 'aegis_matrix') {
+      this.playerStats.damageMultiplier *= 1.25;
+      this.playerStats.critChance += 0.15;
+      this.playerStats.armor += 3;
+    }
+
     // Add starting weapon
     this.addOrUpgradeWeapon(this.hero.startingWeapon);
 
     // Setup input listeners
     this.bindInputs();
     this.resizeCanvas();
+  }
+
+  private recordMissionEvent(metric: MissionMetric, amount: number, mode: 'increment' | 'max' = 'increment') {
+    const res = updateMissionProgress(metric, amount, mode);
+    this.currentMissions = res.progression.missions;
+
+    if (res.newlyCompleted.length > 0) {
+      for (const completed of res.newlyCompleted) {
+        this.missionsCompletedThisRun.push(completed.title);
+        this.bonusXpEarnedThisRun += completed.rewardXp;
+
+        // Visual & audio celebration
+        sound.playLevelUp();
+        this.cameraShake(8);
+        this.damageNumbers.push({
+          x: this.playerX,
+          y: this.playerY - 40,
+          damage: completed.rewardXp,
+          color: '#38bdf8',
+          isCrit: true,
+          alpha: 1.0,
+          life: 1.4,
+          maxLife: 1.4,
+        });
+
+        // Grant bonus experience immediately!
+        this.addXp(completed.rewardXp, true);
+
+        if (this.callbacks.onMissionComplete) {
+          this.callbacks.onMissionComplete(completed, res.newlyUnlockedRelics);
+        }
+      }
+      this.pushStats();
+    }
   }
 
   public resizeCanvas() {
@@ -210,7 +299,10 @@ export class GameEngine {
       this.dashCooldownTimer = this.dashMaxCooldown;
       this.playerInvulnerableTimer = 0.28;
       sound.playDash();
-      this.cameraShake(5);
+      this.cameraShake(6, this.playerFacing, 3.5);
+      this.spawnShockwave(this.playerX, this.playerY, 95, this.hero.avatarColor, 3);
+      this.spawnLightPulse(this.playerX, this.playerY, 195, this.hero.avatarColor, 0.7, 0.32);
+      this.recordMissionEvent('dashes_used', 1, 'increment');
 
       // Dash particle blast
       for (let i = 0; i < 16; i++) {
@@ -237,8 +329,11 @@ export class GameEngine {
     this.playerStats.specialCooldown = this.playerStats.specialMaxCooldown;
 
     sound.playExplosion(true);
-    this.cameraShake(14);
-    this.hitstopTimer = 0.05;
+    this.cameraShake(16, undefined, 11);
+    this.spawnShockwave(this.playerX, this.playerY, 380, this.hero.avatarColor, 6);
+    this.spawnLightPulse(this.playerX, this.playerY, 480, this.hero.avatarColor, 0.95, 0.65);
+    this.hitstopTimer = 0.055;
+    this.recordMissionEvent('specials_used', 1, 'increment');
 
     // Hero specific special effect
     if (this.hero.id === 'vance') {
@@ -304,8 +399,46 @@ export class GameEngine {
     }
   }
 
-  public cameraShake(intensity: number) {
-    this.cameraShakeIntensity = Math.min(22, this.cameraShakeIntensity + intensity);
+  public cameraShake(intensity: number, angle?: number, aberrationBoost?: number) {
+    this.cameraShakeIntensity = Math.min(28, this.cameraShakeIntensity + intensity);
+    this.cameraShakeAngle = angle !== undefined ? angle : Math.random() * Math.PI * 2;
+    const chroma = aberrationBoost !== undefined ? aberrationBoost : intensity * 0.55;
+    this.chromaticAberration = Math.min(16, this.chromaticAberration + chroma);
+  }
+
+  private spawnShockwave(x: number, y: number, maxRadius: number, color: string, lineWidth: number = 4) {
+    this.shockwaves.push({
+      x,
+      y,
+      radius: 12,
+      maxRadius,
+      color,
+      alpha: 0.95,
+      lineWidth,
+    });
+  }
+
+  private spawnLightPulse(
+    x: number,
+    y: number,
+    maxRadius: number,
+    color: string,
+    intensity: number = 0.65,
+    duration: number = 0.35
+  ) {
+    if (this.lightPulses.length >= 64) {
+      this.lightPulses.shift();
+    }
+    this.lightPulses.push({
+      x,
+      y,
+      radius: maxRadius * 0.35,
+      maxRadius,
+      color,
+      intensity: Math.min(1.0, intensity),
+      life: duration,
+      maxLife: duration,
+    });
   }
 
   public start() {
@@ -350,6 +483,12 @@ export class GameEngine {
   private update(dt: number) {
     this.elapsedTime += dt;
 
+    const currentSec = Math.floor(this.elapsedTime);
+    if (currentSec > this.lastTrackedSecond) {
+      this.lastTrackedSecond = currentSec;
+      this.recordMissionEvent('survive_seconds', currentSec, 'max');
+    }
+
     // Victory check
     if (this.elapsedTime >= VICTORY_TIME_SECONDS && !this.activeBoss) {
       this.triggerVictory();
@@ -393,9 +532,53 @@ export class GameEngine {
       }
     }
 
-    // Camera shake decay
+    // Camera shake & Chromatic Aberration decay + Combat Adrenaline calculation
     if (this.cameraShakeIntensity > 0) {
-      this.cameraShakeIntensity = Math.max(0, this.cameraShakeIntensity - dt * 25);
+      this.cameraShakeIntensity = Math.max(0, this.cameraShakeIntensity - dt * 28);
+    }
+
+    // Calculate ambient combat intensity (nearby swarm density, active boss, or low HP)
+    let nearbyThreats = 0;
+    for (let i = 0; i < this.enemies.length; i++) {
+      const e = this.enemies[i];
+      if (Math.hypot(e.x - this.playerX, e.y - this.playerY) < 340) {
+        nearbyThreats += e.isBoss ? 8 : 1;
+      }
+    }
+    const lowHpFactor =
+      this.playerStats.hp / this.playerStats.maxHp < 0.3
+        ? (0.3 - this.playerStats.hp / this.playerStats.maxHp) * 3.3
+        : 0;
+    const targetAdrenaline = Math.min(1, nearbyThreats / 28 + lowHpFactor * 0.65);
+    this.combatAdrenaline += (targetAdrenaline - this.combatAdrenaline) * Math.min(1, dt * 4);
+
+    const minChroma = this.combatAdrenaline > 0.35 ? (this.combatAdrenaline - 0.35) * 4.5 : 0;
+    if (this.chromaticAberration > minChroma) {
+      this.chromaticAberration = Math.max(minChroma, this.chromaticAberration - dt * 20);
+    } else {
+      this.chromaticAberration = minChroma;
+    }
+
+    // Update expanding shockwaves
+    for (let i = this.shockwaves.length - 1; i >= 0; i--) {
+      const sw = this.shockwaves[i];
+      sw.radius += (sw.maxRadius - sw.radius) * Math.min(1, dt * 11) + dt * 120;
+      sw.alpha = Math.max(0, 1 - sw.radius / sw.maxRadius);
+      if (sw.radius >= sw.maxRadius || sw.alpha <= 0.02) {
+        this.shockwaves.splice(i, 1);
+      }
+    }
+
+    // Update dynamic light pulses
+    for (let i = this.lightPulses.length - 1; i >= 0; i--) {
+      const lp = this.lightPulses[i];
+      lp.life -= dt;
+      const progress = 1 - Math.max(0, lp.life / lp.maxLife);
+      // Fast expansion in first 35%, then smooth lingering fade
+      lp.radius = lp.maxRadius * (0.35 + 0.65 * Math.sin(Math.min(1, progress * 1.4) * (Math.PI / 2)));
+      if (lp.life <= 0) {
+        this.lightPulses.splice(i, 1);
+      }
     }
 
     // Player Movement
@@ -533,6 +716,16 @@ export class GameEngine {
 
     sound.playShoot(1.0 + Math.random() * 0.2);
 
+    // Muzzle flash light pulse
+    this.spawnLightPulse(
+      this.playerX + Math.cos(baseAngle) * 18,
+      this.playerY + Math.sin(baseAngle) * 18,
+      70,
+      '#06b6d4',
+      0.42,
+      0.13
+    );
+
     for (let i = 0; i < count; i++) {
       const spread = count > 1 ? (i - (count - 1) / 2) * 0.14 : 0;
       const angle = baseAngle + spread;
@@ -590,8 +783,9 @@ export class GameEngine {
     let prevY = this.playerY;
 
     for (const target of targets) {
-      // Draw lightning bolt particle line
+      // Draw lightning bolt particle line & electric floor flash
       this.createLightningParticles(prevX, prevY, target.x, target.y);
+      this.spawnLightPulse(target.x, target.y, 135, '#38bdf8', 0.78, 0.26);
       this.damageEnemy(target, weapon.damage * this.playerStats.damageMultiplier, Math.random() < this.playerStats.critChance);
 
       // Stun slightly
@@ -629,6 +823,7 @@ export class GameEngine {
   private fireSeekerMissiles(weapon: WeaponState) {
     const count = weapon.projectileCount;
     sound.playPlasma();
+    this.spawnLightPulse(this.playerX, this.playerY, 95, '#f43f5e', 0.55, 0.2);
 
     for (let i = 0; i < count; i++) {
       const angle = this.playerFacing + (i - (count - 1) / 2) * 0.4 + (Math.random() - 0.5) * 0.2;
@@ -662,6 +857,14 @@ export class GameEngine {
 
     sound.playShoot(0.7);
     this.cameraShake(3);
+    this.spawnLightPulse(
+      this.playerX + Math.cos(angle) * 24,
+      this.playerY + Math.sin(angle) * 24,
+      145,
+      '#eab308',
+      0.72,
+      0.24
+    );
 
     // Laser beam projectile that pierces all
     this.projectiles.push({
@@ -793,7 +996,9 @@ export class GameEngine {
 
   private createExplosionBlast(x: number, y: number, radius: number, splashDamage: number) {
     sound.playExplosion(false);
-    this.cameraShake(4);
+    this.cameraShake(5.5, undefined, 3.2);
+    this.spawnShockwave(x, y, radius * 1.15, '#f43f5e', 3);
+    this.spawnLightPulse(x, y, radius * 2.4, '#f43f5e', 0.9, 0.45);
 
     for (const enemy of this.enemies) {
       const dist = Math.hypot(enemy.x - x, enemy.y - y);
@@ -834,7 +1039,8 @@ export class GameEngine {
           // Boss ground slam shockwave
           this.createExplosionBlast(enemy.x, enemy.y, 160, 40);
           sound.playExplosion(true);
-          this.cameraShake(10);
+          this.cameraShake(14, undefined, 9.5);
+          this.spawnShockwave(enemy.x, enemy.y, 220, '#ef4444', 6);
           enemy.telegraphTimer = 4.5;
         }
       }
@@ -962,7 +1168,8 @@ export class GameEngine {
 
     if (isCrit) {
       this.hitstopTimer = 0.03;
-      this.cameraShake(2);
+      this.cameraShake(3, undefined, 2.2);
+      this.spawnLightPulse(enemy.x, enemy.y, 90, '#f59e0b', 0.65, 0.22);
     }
   }
 
@@ -971,10 +1178,43 @@ export class GameEngine {
     this.enemies.splice(index, 1);
     sound.playExplosion(enemy.isBoss);
 
+    // Cast temporary dynamic death light pulse onto the cyber-arena environment
+    const deathLightRadius = enemy.isBoss ? 480 : 105 + enemy.radius * 3.8;
+    const deathLightIntensity = enemy.isBoss ? 1.0 : 0.72;
+    const deathLightDuration = enemy.isBoss ? 0.85 : 0.38;
+    this.spawnLightPulse(enemy.x, enemy.y, deathLightRadius, enemy.color, deathLightIntensity, deathLightDuration);
+
+    // Extra death burst particles for rich visual impact
+    const burstCount = enemy.isBoss ? 32 : 8;
+    for (let p = 0; p < burstCount; p++) {
+      const ang = (p / burstCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
+      const spd = (enemy.isBoss ? 90 : 45) + Math.random() * 110;
+      this.particles.push({
+        x: enemy.x,
+        y: enemy.y,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        radius: enemy.isBoss ? 4 : 2.5,
+        color: p % 3 === 0 ? '#ffffff' : enemy.color,
+        alpha: 0.95,
+        life: enemy.isBoss ? 0.55 : 0.32,
+        maxLife: enemy.isBoss ? 0.55 : 0.32,
+      });
+    }
+
+    // Vampiric Siphon relic healing on every 15 kills
+    if (this.equippedRelic === 'vampiric_siphon' && this.totalKills % 15 === 0) {
+      this.playerStats.hp = Math.min(this.playerStats.maxHp, this.playerStats.hp + 2);
+    }
+
+    this.recordMissionEvent('kills', 1, 'increment');
+
     if (enemy.isBoss) {
-      this.hitstopTimer = 0.08;
-      this.cameraShake(14);
+      this.hitstopTimer = 0.085;
+      this.cameraShake(18, undefined, 13);
+      this.spawnShockwave(enemy.x, enemy.y, 340, '#f59e0b', 7);
       this.activeBoss = null;
+      this.recordMissionEvent('boss_kills', 1, 'increment');
       // Drop mega upgrade chest or massive gems
       for (let g = 0; g < 10; g++) {
         this.dropGem(enemy.x + (Math.random() - 0.5) * 60, enemy.y + (Math.random() - 0.5) * 60, 25);
@@ -1058,7 +1298,8 @@ export class GameEngine {
             sound.playPlasma();
           } else if (gem.pickupType === 'nuke') {
             // Nuke wipes out all regular enemies on screen
-            this.cameraShake(16);
+            this.cameraShake(19, undefined, 14);
+            this.spawnShockwave(this.playerX, this.playerY, 620, '#f97316', 8);
             sound.playExplosion(true);
             for (const enemy of [...this.enemies]) {
               if (!enemy.isBoss) {
@@ -1071,20 +1312,23 @@ export class GameEngine {
           this.gemComboCount += 1;
           this.gemComboTimer = 1.2;
           sound.playGemCollect(this.gemComboCount);
+          this.recordMissionEvent('gems_collected', 1, 'increment');
           this.addXp(gem.value);
         }
       }
     }
   }
 
-  private addXp(amount: number) {
-    this.playerStats.xp += amount;
+  private addXp(amount: number, isBonusReward: boolean = false) {
+    const scaledXp = isBonusReward ? amount : amount * this.xpGainMultiplier;
+    this.playerStats.xp += scaledXp;
     if (this.playerStats.xp >= this.playerStats.xpToNextLevel) {
       this.playerStats.xp -= this.playerStats.xpToNextLevel;
       this.playerStats.level += 1;
       this.playerStats.xpToNextLevel = Math.round(this.playerStats.xpToNextLevel * 1.35 + 8);
 
       sound.playLevelUp();
+      this.recordMissionEvent('reach_level', this.playerStats.level, 'max');
       this.triggerLevelUp();
     }
   }
@@ -1231,7 +1475,8 @@ export class GameEngine {
     this.playerInvulnerableTimer = 0.35;
 
     sound.playHit();
-    this.cameraShake(8);
+    this.cameraShake(11, undefined, 8.5);
+    this.spawnShockwave(this.playerX, this.playerY, 130, '#ef4444', 4);
 
     if (this.playerStats.hp <= 0) {
       this.playerStats.hp = 0;
@@ -1249,8 +1494,15 @@ export class GameEngine {
       hero: this.hero,
       weaponsUsed: Array.from(this.weapons.values()).map((w) => ({ id: w.id, level: w.level })),
       passivesUsed: Array.from(this.passives.entries()).map(([id, level]) => ({ id, level })),
-      score: Math.floor(this.totalKills * 12 + this.elapsedTime * 15 + this.playerStats.level * 100),
+      score: Math.floor(
+        this.totalKills * 12 +
+          this.elapsedTime * 15 +
+          this.playerStats.level * 100 +
+          this.missionsCompletedThisRun.length * 350
+      ),
       isVictory: false,
+      missionsCompletedThisRun: this.missionsCompletedThisRun,
+      bonusXpEarnedThisRun: this.bonusXpEarnedThisRun,
     };
     this.callbacks.onGameOver(stats);
   }
@@ -1265,40 +1517,101 @@ export class GameEngine {
       hero: this.hero,
       weaponsUsed: Array.from(this.weapons.values()).map((w) => ({ id: w.id, level: w.level })),
       passivesUsed: Array.from(this.passives.entries()).map(([id, level]) => ({ id, level })),
-      score: Math.floor(this.totalKills * 20 + this.elapsedTime * 25 + this.playerStats.level * 250 + 5000),
+      score: Math.floor(
+        this.totalKills * 20 +
+          this.elapsedTime * 25 +
+          this.playerStats.level * 250 +
+          5000 +
+          this.missionsCompletedThisRun.length * 500
+      ),
       isVictory: true,
+      missionsCompletedThisRun: this.missionsCompletedThisRun,
+      bonusXpEarnedThisRun: this.bonusXpEarnedThisRun,
     };
     this.callbacks.onVictory(stats);
   }
 
   private updateSpawners(dt: number) {
     this.enemySpawnTimer += dt;
+    this.swarmSurgeCooldown -= dt;
 
-    // Difficulty scaling based on elapsed minutes
+    // Adaptive Director Algorithm: combines elapsed time, total kills, and kill velocity (Kills Per Minute)
     const minutes = this.elapsedTime / 60;
-    const spawnInterval = Math.max(0.18, 0.9 - minutes * 0.12);
+    const effectiveMinutes = Math.max(0.25, minutes);
+    const killRatePerMin = this.totalKills / effectiveMinutes;
+
+    const timeFactor = Math.pow(minutes, 1.18) * 0.48;
+    const killFactor = (this.totalKills / 120) * 0.42;
+    const tempoBonus = Math.min(1.2, (killRatePerMin / 65) * 0.35);
+
+    this.threatMultiplier = Number((1.0 + timeFactor + killFactor + tempoBonus).toFixed(2));
+
+    if (this.threatMultiplier < 1.5) this.threatTier = 'STABLE';
+    else if (this.threatMultiplier < 2.3) this.threatTier = 'ELEVATED';
+    else if (this.threatMultiplier < 3.4) this.threatTier = 'HIGH';
+    else if (this.threatMultiplier < 4.8) this.threatTier = 'CRITICAL';
+    else this.threatTier = 'OVERDRIVE';
+
+    // Spawn interval tightens with both time and kill-driven threatMultiplier
+    const spawnInterval = Math.max(0.12, 0.88 / Math.pow(this.threatMultiplier, 0.58));
 
     if (this.enemySpawnTimer >= spawnInterval) {
       this.enemySpawnTimer = 0;
-      this.spawnEnemiesWave(minutes);
+      this.spawnEnemiesWave(minutes, this.threatMultiplier);
     }
 
-    // Mini-boss at 2:15
-    if (this.elapsedTime >= 135 && !this.miniBossSpawned) {
+    // Coordinated Swarm Encirclement Surge when kill tempo or threat is high
+    if (this.swarmSurgeCooldown <= 0 && (this.totalKills >= 30 || minutes >= 0.6)) {
+      this.swarmSurgeCooldown = Math.max(12, 26 - this.threatMultiplier * 2.5);
+      this.spawnSwarmRing(this.threatMultiplier);
+    }
+
+    // Mini-boss at 2:00 or 140 kills
+    if ((this.elapsedTime >= 120 || this.totalKills >= 140) && !this.miniBossSpawned) {
       this.miniBossSpawned = true;
-      this.spawnBoss('Goliath Mecha', 1400, 36, '#f97316', 35);
+      this.spawnBoss('Goliath Mecha', Math.round(1400 * Math.max(1, this.threatMultiplier * 0.65)), 36, '#f97316', 35);
     }
 
-    // Final Dreadnought Overlord Boss at 4:30
-    if (this.elapsedTime >= 270 && !this.finalBossSpawned) {
+    // Final Dreadnought Overlord Boss at 4:15 or 320 kills
+    if ((this.elapsedTime >= 255 || this.totalKills >= 320) && !this.finalBossSpawned) {
       this.finalBossSpawned = true;
-      this.spawnBoss('Dreadnought Overlord', 3200, 48, '#ef4444', 50);
+      this.spawnBoss('Dreadnought Overlord', Math.round(3200 * Math.max(1, this.threatMultiplier * 0.6)), 48, '#ef4444', 50);
+    }
+  }
+
+  private spawnSwarmRing(threat: number) {
+    const dynamicCap = Math.min(340, Math.floor(170 + threat * 45));
+    if (this.enemies.length >= dynamicCap) return;
+
+    const ringCount = Math.min(18, Math.floor(8 + threat * 2.2));
+    const radius = 520;
+    for (let i = 0; i < ringCount; i++) {
+      const angle = (i / ringCount) * Math.PI * 2;
+      const x = this.playerX + Math.cos(angle) * radius;
+      const y = this.playerY + Math.sin(angle) * radius;
+      this.enemies.push({
+        id: this.nextEnemyId++,
+        x,
+        y,
+        vx: 0,
+        vy: 0,
+        radius: 11,
+        hp: 20 + threat * 11,
+        maxHp: 20 + threat * 11,
+        speed: 135 + threat * 9,
+        damage: 9 + threat * 1.5,
+        color: '#ec4899',
+        type: 'skitter',
+        xpValue: 2,
+        hitFlashTimer: 0,
+        attackCooldown: 0,
+      });
     }
   }
 
   private spawnBoss(name: string, hp: number, radius: number, color: string, damage: number) {
     sound.playBossAlarm();
-    this.cameraShake(12);
+    this.cameraShake(15, undefined, 10);
 
     const angle = Math.random() * Math.PI * 2;
     const dist = 550;
@@ -1314,7 +1627,7 @@ export class GameEngine {
       radius,
       hp,
       maxHp: hp,
-      speed: 65,
+      speed: 68,
       damage,
       color,
       type: 'boss',
@@ -1331,52 +1644,64 @@ export class GameEngine {
     this.activeBoss = boss;
   }
 
-  private spawnEnemiesWave(minutes: number) {
-    if (this.enemies.length >= 260) return; // Prevent performance drop
+  private spawnEnemiesWave(minutes: number, threat: number) {
+    const dynamicCap = Math.min(340, Math.floor(170 + threat * 45));
+    if (this.enemies.length >= dynamicCap) return;
 
-    const count = 2 + Math.floor(minutes * 2);
+    // Swarm batch size scales with both elapsed time and kill-based threatMultiplier
+    const count = Math.min(12, Math.floor(2 + threat * 1.65 + (this.totalKills / 95)));
+    const clusterAngle = Math.random() * Math.PI * 2;
+
     for (let i = 0; i < count; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const dist = 500 + Math.random() * 200;
+      // Mix 60% directional pack clustering with 40% 360-degree surround
+      const angle =
+        i % 3 === 0
+          ? Math.random() * Math.PI * 2
+          : clusterAngle + (Math.random() - 0.5) * 0.65;
+      const dist = 480 + Math.random() * 210;
       const x = this.playerX + Math.cos(angle) * dist;
       const y = this.playerY + Math.sin(angle) * dist;
 
       const rand = Math.random();
       let type: Enemy['type'] = 'crawler';
-      let hp = 24 + minutes * 15;
-      let speed = 90 + minutes * 8;
+      let hp = 22 + threat * 14;
+      let speed = 92 + threat * 7;
       let radius = 13;
       let color = '#a855f7'; // crawler purple
-      let damage = 10 + minutes * 2;
+      let damage = 10 + threat * 2;
       let xpValue = 1;
 
-      if (minutes > 0.8 && rand < 0.3) {
-        // Skitter: fast and agile
-        type = 'skitter';
-        hp = 18 + minutes * 10;
-        speed = 150 + minutes * 12;
-        radius = 10;
-        color = '#ec4899';
-        damage = 8;
-        xpValue = 2;
-      } else if (minutes > 1.8 && rand < 0.5) {
-        // Brute: heavy, tanky
-        type = 'brute';
-        hp = 85 + minutes * 40;
-        speed = 60 + minutes * 5;
-        radius = 22;
-        color = '#f59e0b';
-        damage = 22;
-        xpValue = 5;
-      } else if (minutes > 2.5 && rand < 0.7) {
-        // Spitter: fires ranged projectile
+      const skitterUnlock = minutes > 0.4 || this.totalKills >= 20;
+      const bruteUnlock = minutes > 1.2 || this.totalKills >= 65;
+      const spitterUnlock = minutes > 1.8 || this.totalKills >= 110;
+
+      if (spitterUnlock && rand < Math.min(0.26, 0.1 + threat * 0.03)) {
+        // Spitter: ranged bio-plasma artillery
         type = 'spitter';
-        hp = 45 + minutes * 20;
-        speed = 75;
+        hp = 42 + threat * 18;
+        speed = 78 + threat * 4;
         radius = 15;
         color = '#10b981';
-        damage = 14;
+        damage = 14 + threat * 2;
         xpValue = 4;
+      } else if (bruteUnlock && rand < Math.min(0.46, 0.22 + threat * 0.04)) {
+        // Brute: heavy armored juggernaut
+        type = 'brute';
+        hp = 82 + threat * 36;
+        speed = 62 + threat * 5;
+        radius = 22;
+        color = '#f59e0b';
+        damage = 22 + threat * 3;
+        xpValue = 5;
+      } else if (skitterUnlock && rand < Math.min(0.75, 0.45 + threat * 0.05)) {
+        // Skitter: high-speed swarminterceptor
+        type = 'skitter';
+        hp = 16 + threat * 9;
+        speed = 148 + threat * 11;
+        radius = 10;
+        color = '#ec4899';
+        damage = 8 + threat * 1.5;
+        xpValue = 2;
       }
 
       this.enemies.push({
@@ -1444,6 +1769,10 @@ export class GameEngine {
             maxHp: Math.round(this.activeBoss.maxHp),
           }
         : undefined,
+      missions: this.currentMissions,
+      equippedRelic: this.equippedRelic,
+      threatMultiplier: this.threatMultiplier,
+      threatTier: this.threatTier,
     });
   }
 
@@ -1453,22 +1782,39 @@ export class GameEngine {
     const w = this.canvas.width;
     const h = this.canvas.height;
 
-    // Apply camera shake offset
+    // Directional + high-frequency trauma screen shake
     let shakeX = 0;
     let shakeY = 0;
-    if (this.cameraShakeIntensity > 0) {
-      shakeX = (Math.random() - 0.5) * this.cameraShakeIntensity * 2;
-      shakeY = (Math.random() - 0.5) * this.cameraShakeIntensity * 2;
+    let rollAngle = 0;
+    if (this.cameraShakeIntensity > 0.1) {
+      const t = performance.now() * 0.055;
+      const directionalKick = Math.sin(t * 1.7) * this.cameraShakeIntensity * 0.65;
+      const jitterX = (Math.random() - 0.5) * this.cameraShakeIntensity * 1.45;
+      const jitterY = (Math.random() - 0.5) * this.cameraShakeIntensity * 1.45;
+      shakeX = Math.cos(this.cameraShakeAngle) * directionalKick + jitterX;
+      shakeY = Math.sin(this.cameraShakeAngle) * directionalKick + jitterY;
+      rollAngle = ((Math.random() - 0.5) * this.cameraShakeIntensity * 0.0018);
     }
 
     ctx.save();
     ctx.clearRect(0, 0, w, h);
 
+    // Subtle rotational camera roll around screen center during heavy impacts
+    if (Math.abs(rollAngle) > 0.0001) {
+      ctx.translate(w / 2, h / 2);
+      ctx.rotate(rollAngle);
+      ctx.translate(-w / 2, -h / 2);
+    }
+
     // Camera transform
     ctx.translate(-this.cameraX + shakeX, -this.cameraY + shakeY);
 
-    // Draw sci-fi cyberpunk grid arena floor
+    // Draw sci-fi cyberpunk grid arena floor + dynamic environment lighting
     this.renderFloor(ctx);
+    this.renderDynamicFloorLighting(ctx, w, h);
+
+    // Draw expanding shockwave rings
+    this.renderShockwaves(ctx);
 
     // Draw Gems & Pickups
     this.renderGems(ctx);
@@ -1485,8 +1831,279 @@ export class GameEngine {
     // Draw Player
     this.renderPlayer(ctx);
 
+    // Draw volumetric atmospheric bloom from projectiles & death light pulses
+    this.renderAtmosphericBloom(ctx, w, h);
+
+    // Draw Chromatic Aberration RGB channel split pass during intense combat
+    if (this.chromaticAberration > 0.25) {
+      this.renderChromaticAberrationPass(ctx);
+    }
+
     // Draw Damage numbers
     this.renderDamageNumbers(ctx);
+
+    ctx.restore();
+
+    // Screen-space adrenaline & chromatic edge vignette
+    if (this.chromaticAberration > 0.35 || this.combatAdrenaline > 0.25) {
+      this.renderScreenSpaceEffects(ctx, w, h);
+    }
+  }
+
+  private hexToRgb(hex: string): { r: number; g: number; b: number } {
+    const clean = hex.replace('#', '');
+    const num = parseInt(clean.length === 3 ? clean.replace(/(.)/g, '$1$1') : clean, 16);
+    if (Number.isNaN(num)) return { r: 56, g: 189, b: 248 };
+    return {
+      r: (num >> 16) & 255,
+      g: (num >> 8) & 255,
+      b: num & 255,
+    };
+  }
+
+  private renderDynamicFloorLighting(ctx: CanvasRenderingContext2D, viewW: number, viewH: number) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+
+    const cullX = viewW * 0.72;
+    const cullY = viewH * 0.72;
+    const gridStep = 80;
+
+    // 1. Render temporary light pulses (enemy deaths, explosions, muzzle flashes, abilities)
+    for (let i = 0; i < this.lightPulses.length; i++) {
+      const lp = this.lightPulses[i];
+      if (Math.abs(lp.x - this.playerX) > cullX || Math.abs(lp.y - this.playerY) > cullY) continue;
+
+      const lifeRatio = Math.max(0, lp.life / lp.maxLife);
+      // Smooth ease-out curve for atmospheric decay
+      const alpha = lp.intensity * Math.pow(lifeRatio, 1.35) * 0.38;
+      if (alpha <= 0.01) continue;
+
+      const { r, g, b } = this.hexToRgb(lp.color);
+      const grad = ctx.createRadialGradient(lp.x, lp.y, 2, lp.x, lp.y, lp.radius);
+      grad.addColorStop(0, `rgba(255, 255, 255, ${Math.min(0.65, alpha * 1.35)})`);
+      grad.addColorStop(0.25, `rgba(${r}, ${g}, ${b}, ${alpha})`);
+      grad.addColorStop(0.65, `rgba(${r}, ${g}, ${b}, ${alpha * 0.35})`);
+      grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(lp.x, lp.y, lp.radius, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Illuminate nearby cyber-grid lines & intersection nodes within the light pulse!
+      const gxStart = Math.ceil((lp.x - lp.radius) / gridStep) * gridStep;
+      const gxEnd = Math.floor((lp.x + lp.radius) / gridStep) * gridStep;
+      const gyStart = Math.ceil((lp.y - lp.radius) / gridStep) * gridStep;
+      const gyEnd = Math.floor((lp.y + lp.radius) / gridStep) * gridStep;
+
+      ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${Math.min(0.55, alpha * 1.4)})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      for (let gx = gxStart; gx <= gxEnd; gx += gridStep) {
+        const dx = Math.abs(gx - lp.x);
+        if (dx < lp.radius) {
+          const span = Math.sqrt(lp.radius * lp.radius - dx * dx);
+          ctx.moveTo(gx, lp.y - span);
+          ctx.lineTo(gx, lp.y + span);
+        }
+      }
+      for (let gy = gyStart; gy <= gyEnd; gy += gridStep) {
+        const dy = Math.abs(gy - lp.y);
+        if (dy < lp.radius) {
+          const span = Math.sqrt(lp.radius * lp.radius - dy * dy);
+          ctx.moveTo(lp.x - span, gy);
+          ctx.lineTo(lp.x + span, gy);
+        }
+      }
+      ctx.stroke();
+    }
+
+    // 2. Render real-time moving floor illumination from active projectiles
+    for (let i = 0; i < this.projectiles.length; i++) {
+      const p = this.projectiles[i];
+      if (Math.abs(p.x - this.playerX) > cullX || Math.abs(p.y - this.playerY) > cullY) continue;
+
+      let lightRadius = 58;
+      let baseAlpha = 0.16;
+      if (p.type === 'beam') {
+        lightRadius = 135;
+        baseAlpha = 0.28;
+      } else if (p.type === 'missile') {
+        lightRadius = 92;
+        baseAlpha = 0.22;
+      } else if (p.type === 'mine') {
+        lightRadius = 82 + Math.sin(performance.now() * 0.008 + p.id) * 10;
+        baseAlpha = 0.2;
+      } else if (p.type === 'blade') {
+        lightRadius = 68;
+        baseAlpha = 0.17;
+      }
+
+      const { r, g, b } = this.hexToRgb(p.color);
+      const grad = ctx.createRadialGradient(p.x, p.y, 1, p.x, p.y, lightRadius);
+      grad.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${baseAlpha})`);
+      grad.addColorStop(0.5, `rgba(${r}, ${g}, ${b}, ${baseAlpha * 0.4})`);
+      grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, lightRadius, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Highlight nearest grid intersection node under the projectile
+      const nearGx = Math.round(p.x / gridStep) * gridStep;
+      const nearGy = Math.round(p.y / gridStep) * gridStep;
+      const nodeDist = Math.hypot(nearGx - p.x, nearGy - p.y);
+      if (nodeDist < lightRadius * 0.85) {
+        const nodeAlpha = (1 - nodeDist / (lightRadius * 0.85)) * 0.55;
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${nodeAlpha})`;
+        ctx.fillRect(nearGx - 3, nearGy - 3, 6, 6);
+      }
+    }
+
+    ctx.restore();
+  }
+
+  private renderAtmosphericBloom(ctx: CanvasRenderingContext2D, viewW: number, viewH: number) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+
+    const cullX = viewW * 0.72;
+    const cullY = viewH * 0.72;
+
+    // Soft volumetric top-layer bloom for death light pulses & explosions
+    for (let i = 0; i < this.lightPulses.length; i++) {
+      const lp = this.lightPulses[i];
+      if (Math.abs(lp.x - this.playerX) > cullX || Math.abs(lp.y - this.playerY) > cullY) continue;
+
+      const lifeRatio = Math.max(0, lp.life / lp.maxLife);
+      const bloomAlpha = lp.intensity * Math.pow(lifeRatio, 1.6) * 0.24;
+      if (bloomAlpha <= 0.01) continue;
+
+      const { r, g, b } = this.hexToRgb(lp.color);
+      const bloomRadius = lp.radius * 0.65;
+      const grad = ctx.createRadialGradient(lp.x, lp.y, 0, lp.x, lp.y, bloomRadius);
+      grad.addColorStop(0, `rgba(255, 255, 255, ${bloomAlpha * 1.2})`);
+      grad.addColorStop(0.35, `rgba(${r}, ${g}, ${b}, ${bloomAlpha})`);
+      grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(lp.x, lp.y, bloomRadius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }
+
+  private renderShockwaves(ctx: CanvasRenderingContext2D) {
+    for (const sw of this.shockwaves) {
+      ctx.save();
+      ctx.globalAlpha = sw.alpha;
+      ctx.strokeStyle = sw.color;
+      ctx.lineWidth = sw.lineWidth;
+      ctx.beginPath();
+      ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  private renderChromaticAberrationPass(ctx: CanvasRenderingContext2D) {
+    const shift = Math.min(14, this.chromaticAberration * 1.15);
+    const alpha = Math.min(0.55, 0.14 + (this.chromaticAberration / 16) * 0.42);
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = alpha;
+
+    // Red-channel horizontal shift (-shift) & Cyan-channel shift (+shift) around player, active enemies, and projectiles
+    ctx.fillStyle = '#ff1744';
+    ctx.beginPath();
+    ctx.arc(this.playerX - shift, this.playerY - shift * 0.35, this.playerRadius + 2, 0, Math.PI * 2);
+    for (let i = 0; i < this.enemies.length; i++) {
+      const e = this.enemies[i];
+      if (Math.abs(e.x - this.playerX) < 680 && Math.abs(e.y - this.playerY) < 480) {
+        ctx.moveTo(e.x - shift + e.radius, e.y);
+        ctx.arc(e.x - shift, e.y - shift * 0.25, e.radius, 0, Math.PI * 2);
+      }
+    }
+    for (let i = 0; i < this.projectiles.length; i++) {
+      const p = this.projectiles[i];
+      ctx.moveTo(p.x - shift + p.radius, p.y);
+      ctx.arc(p.x - shift, p.y, p.radius + 1, 0, Math.PI * 2);
+    }
+    ctx.fill();
+
+    ctx.fillStyle = '#00e5ff';
+    ctx.beginPath();
+    ctx.arc(this.playerX + shift, this.playerY + shift * 0.35, this.playerRadius + 2, 0, Math.PI * 2);
+    for (let i = 0; i < this.enemies.length; i++) {
+      const e = this.enemies[i];
+      if (Math.abs(e.x - this.playerX) < 680 && Math.abs(e.y - this.playerY) < 480) {
+        ctx.moveTo(e.x + shift + e.radius, e.y);
+        ctx.arc(e.x + shift, e.y + shift * 0.25, e.radius, 0, Math.PI * 2);
+      }
+    }
+    for (let i = 0; i < this.projectiles.length; i++) {
+      const p = this.projectiles[i];
+      ctx.moveTo(p.x + shift + p.radius, p.y);
+      ctx.arc(p.x + shift, p.y, p.radius + 1, 0, Math.PI * 2);
+    }
+    ctx.fill();
+
+    // Chromatic split on shockwave rings
+    for (const sw of this.shockwaves) {
+      ctx.lineWidth = Math.max(1.5, sw.lineWidth * 0.7);
+      ctx.strokeStyle = '#ff1744';
+      ctx.beginPath();
+      ctx.arc(sw.x - shift * 0.9, sw.y, sw.radius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.strokeStyle = '#00e5ff';
+      ctx.beginPath();
+      ctx.arc(sw.x + shift * 0.9, sw.y, sw.radius, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  private renderScreenSpaceEffects(ctx: CanvasRenderingContext2D, w: number, h: number) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+
+    const chromaRatio = Math.min(1, this.chromaticAberration / 14);
+    const pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.012);
+    const edgeAlpha = Math.min(0.32, chromaRatio * 0.24 + this.combatAdrenaline * 0.12 * pulse);
+
+    if (edgeAlpha > 0.02) {
+      // Left Red/Magenta fringe
+      const leftGrad = ctx.createLinearGradient(0, 0, w * 0.12, 0);
+      leftGrad.addColorStop(0, `rgba(255, 23, 68, ${edgeAlpha})`);
+      leftGrad.addColorStop(1, 'rgba(255, 23, 68, 0)');
+      ctx.fillStyle = leftGrad;
+      ctx.fillRect(0, 0, w * 0.12, h);
+
+      // Right Cyan fringe
+      const rightGrad = ctx.createLinearGradient(w, 0, w * 0.88, 0);
+      rightGrad.addColorStop(0, `rgba(0, 229, 255, ${edgeAlpha})`);
+      rightGrad.addColorStop(1, 'rgba(0, 229, 255, 0)');
+      ctx.fillStyle = rightGrad;
+      ctx.fillRect(w * 0.88, 0, w * 0.12, h);
+
+      // Top/Bottom subtle chromatic scanlines on heavy impacts
+      if (this.chromaticAberration > 4.5) {
+        const glitchLines = Math.min(6, Math.floor(this.chromaticAberration / 2.2));
+        for (let i = 0; i < glitchLines; i++) {
+          const sliceY = ((performance.now() * 0.37 + i * 197) % h);
+          const sliceH = 2 + (i % 3);
+          ctx.fillStyle = i % 2 === 0 ? `rgba(255, 23, 68, ${edgeAlpha * 0.65})` : `rgba(0, 229, 255, ${edgeAlpha * 0.65})`;
+          ctx.fillRect(0, sliceY, w, sliceH);
+        }
+      }
+    }
 
     ctx.restore();
   }
@@ -1494,18 +2111,33 @@ export class GameEngine {
   private renderFloor(ctx: CanvasRenderingContext2D) {
     const half = MAP_SIZE / 2;
 
-    // Arena background
-    ctx.fillStyle = '#030712';
+    // Deep obsidian cyber-arena floor
+    ctx.fillStyle = '#02050d';
     ctx.fillRect(-half, -half, MAP_SIZE, MAP_SIZE);
 
-    // Grid lines
+    // Subtle radial spotlight around player
+    const spot = ctx.createRadialGradient(
+      this.playerX,
+      this.playerY,
+      20,
+      this.playerX,
+      this.playerY,
+      540
+    );
+    spot.addColorStop(0, 'rgba(6, 182, 212, 0.08)');
+    spot.addColorStop(0.5, 'rgba(168, 85, 247, 0.03)');
+    spot.addColorStop(1, 'rgba(2, 5, 13, 0)');
+    ctx.fillStyle = spot;
+    ctx.fillRect(this.playerX - 560, this.playerY - 560, 1120, 1120);
+
+    // Primary Grid lines
     ctx.strokeStyle = 'rgba(30, 41, 59, 0.45)';
     ctx.lineWidth = 1;
     const step = 80;
 
-    const startX = Math.floor((-half) / step) * step;
+    const startX = Math.floor(-half / step) * step;
     const endX = Math.ceil(half / step) * step;
-    const startY = Math.floor((-half) / step) * step;
+    const startY = Math.floor(-half / step) * step;
     const endY = Math.ceil(half / step) * step;
 
     ctx.beginPath();
@@ -1518,6 +2150,16 @@ export class GameEngine {
       ctx.lineTo(half, y);
     }
     ctx.stroke();
+
+    // Glowing intersection nodes every 320px
+    ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';
+    for (let x = startX; x <= endX; x += 320) {
+      for (let y = startY; y <= endY; y += 320) {
+        if (Math.abs(x - this.playerX) < 850 && Math.abs(y - this.playerY) < 600) {
+          ctx.fillRect(x - 2, y - 2, 4, 4);
+        }
+      }
+    }
 
     // Map boundary hazard laser fence
     ctx.strokeStyle = '#ef4444';
@@ -1535,34 +2177,37 @@ export class GameEngine {
   private renderGems(ctx: CanvasRenderingContext2D) {
     for (const gem of this.gems) {
       if (gem.isPickup) {
-        // Glowing animated icon for pickups
         ctx.save();
         ctx.shadowColor = gem.color;
-        ctx.shadowBlur = 12;
+        ctx.shadowBlur = 14;
         ctx.fillStyle = gem.color;
         ctx.beginPath();
         ctx.arc(gem.x, gem.y, gem.radius, 0, Math.PI * 2);
         ctx.fill();
 
-        // Inner marker
         ctx.fillStyle = '#ffffff';
         ctx.beginPath();
         ctx.arc(gem.x, gem.y, gem.radius * 0.45, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
       } else {
-        // Diamond XP gem
+        // Faceted crystalline XP gem
         ctx.save();
         ctx.fillStyle = gem.color;
         ctx.shadowColor = gem.color;
-        ctx.shadowBlur = 6;
+        ctx.shadowBlur = 8;
         ctx.beginPath();
-        const r = gem.radius;
+        const r = gem.radius * 1.15;
         ctx.moveTo(gem.x, gem.y - r);
-        ctx.lineTo(gem.x + r, gem.y);
+        ctx.lineTo(gem.x + r * 0.85, gem.y);
         ctx.lineTo(gem.x, gem.y + r);
-        ctx.lineTo(gem.x - r, gem.y);
+        ctx.lineTo(gem.x - r * 0.85, gem.y);
         ctx.closePath();
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(gem.x, gem.y - r * 0.25, r * 0.22, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
       }
@@ -1577,51 +2222,105 @@ export class GameEngine {
       if (enemy.isBoss && enemy.telegraphTimer !== undefined) {
         const progress = 1 - enemy.telegraphTimer / (enemy.telegraphMax || 3.0);
         ctx.strokeStyle = `rgba(239, 68, 68, ${0.3 + progress * 0.5})`;
-        ctx.lineWidth = 2;
+        ctx.lineWidth = 2.5;
         ctx.beginPath();
         ctx.arc(enemy.x, enemy.y, 160 * progress, 0, Math.PI * 2);
         ctx.stroke();
       }
 
-      // Hit flash: pure white silhouette
+      const ang = Math.atan2(this.playerY - enemy.y, this.playerX - enemy.x);
+      ctx.translate(enemy.x, enemy.y);
+      ctx.rotate(ang);
+
       if (enemy.hitFlashTimer > 0) {
         ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = '#ffffff';
         ctx.shadowColor = '#ffffff';
-        ctx.shadowBlur = 14;
+        ctx.shadowBlur = 16;
       } else {
         ctx.fillStyle = enemy.color;
+        ctx.strokeStyle = '#f8fafc';
         ctx.shadowColor = enemy.color;
-        ctx.shadowBlur = enemy.isBoss ? 20 : 6;
+        ctx.shadowBlur = enemy.isBoss ? 22 : 8;
       }
 
-      ctx.beginPath();
-      ctx.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
-      ctx.fill();
+      const r = enemy.radius;
 
-      // Inner details for bosses or brutes
-      if (enemy.radius >= 18) {
-        ctx.fillStyle = '#0f172a';
+      if (enemy.type === 'skitter') {
+        // Sleek swept-wing dart silhouette
         ctx.beginPath();
-        ctx.arc(enemy.x, enemy.y, enemy.radius * 0.4, 0, Math.PI * 2);
+        ctx.moveTo(r * 1.3, 0);
+        ctx.lineTo(-r * 0.9, -r * 0.95);
+        ctx.lineTo(-r * 0.4, 0);
+        ctx.lineTo(-r * 0.9, r * 0.95);
+        ctx.closePath();
+        ctx.fill();
+      } else if (enemy.type === 'brute' || enemy.isBoss) {
+        // Hexagonal heavy mecha dreadnought carapace
+        ctx.beginPath();
+        const sides = enemy.isBoss ? 8 : 6;
+        for (let s = 0; s < sides; s++) {
+          const a = (s / sides) * Math.PI * 2;
+          const px = Math.cos(a) * r;
+          const py = Math.sin(a) * r;
+          if (s === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+
+        // Dark armored core & glowing reactor eye
+        ctx.fillStyle = '#090d16';
+        ctx.beginPath();
+        ctx.arc(0, 0, r * 0.52, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = enemy.hitFlashTimer > 0 ? '#ffffff' : '#fef08a';
+        ctx.beginPath();
+        ctx.arc(r * 0.2, 0, r * 0.22, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (enemy.type === 'spitter') {
+        // Bio-plasma artillery diamond pod
+        ctx.beginPath();
+        ctx.moveTo(r * 1.15, 0);
+        ctx.lineTo(0, -r * 0.9);
+        ctx.lineTo(-r, 0);
+        ctx.lineTo(0, r * 0.9);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.fillStyle = '#ecfccb';
+        ctx.beginPath();
+        ctx.arc(r * 0.25, 0, r * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        // Crawler: multi-mandible alien drone
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#090d16';
+        ctx.beginPath();
+        ctx.arc(r * 0.25, 0, r * 0.38, 0, Math.PI * 2);
         ctx.fill();
       }
+
+      ctx.restore();
 
       // Health bar above enemy if damaged
       if (enemy.hp < enemy.maxHp && !enemy.isBoss) {
         const barW = enemy.radius * 2.2;
         const barH = 3;
         const barX = enemy.x - barW / 2;
-        const barY = enemy.y - enemy.radius - 8;
+        const barY = enemy.y - enemy.radius - 9;
 
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.8)';
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
         ctx.fillRect(barX, barY, barW, barH);
 
         const hpRatio = Math.max(0, enemy.hp / enemy.maxHp);
         ctx.fillStyle = '#ef4444';
         ctx.fillRect(barX, barY, barW * hpRatio, barH);
       }
-
-      ctx.restore();
     }
   }
 
@@ -1630,30 +2329,33 @@ export class GameEngine {
       ctx.save();
       ctx.fillStyle = p.color;
       ctx.shadowColor = p.color;
-      ctx.shadowBlur = 10;
+      ctx.shadowBlur = 12;
 
       if (p.type === 'blade') {
-        // Rotating laser blade
         ctx.translate(p.x, p.y);
-        ctx.rotate((p.orbitAngle || 0) * 3);
-        ctx.fillRect(-12, -4, 24, 8);
+        ctx.rotate((p.orbitAngle || 0) * 3.5);
+        ctx.beginPath();
+        ctx.moveTo(15, 0);
+        ctx.lineTo(0, -5);
+        ctx.lineTo(-15, 0);
+        ctx.lineTo(0, 5);
+        ctx.closePath();
+        ctx.fill();
       } else if (p.type === 'beam') {
-        // Laser beam segment
         const angle = Math.atan2(p.vy, p.vx);
         ctx.translate(p.x, p.y);
         ctx.rotate(angle);
-        ctx.fillRect(-p.radius * 2, -p.radius / 2, p.radius * 4, p.radius);
+        ctx.fillRect(-p.radius * 2.2, -p.radius / 2, p.radius * 4.4, p.radius);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(-p.radius * 2, -p.radius * 0.2, p.radius * 4, p.radius * 0.4);
       } else if (p.type === 'missile') {
-        // Rocket body
         const angle = Math.atan2(p.vy, p.vx);
         ctx.translate(p.x, p.y);
         ctx.rotate(angle);
         ctx.fillRect(-8, -4, 16, 8);
-        // Rocket flame
         ctx.fillStyle = '#fbbf24';
-        ctx.fillRect(-12, -2, 4, 4);
+        ctx.fillRect(-13, -2.5, 5, 5);
       } else if (p.type === 'mine') {
-        // Proximity mine pulse
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
         ctx.fill();
@@ -1661,9 +2363,11 @@ export class GameEngine {
         ctx.lineWidth = 2;
         ctx.stroke();
       } else {
-        // Bullet / spit
+        const angle = Math.atan2(p.vy, p.vx);
+        ctx.translate(p.x, p.y);
+        ctx.rotate(angle);
         ctx.beginPath();
-        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.ellipse(0, 0, p.radius * 1.6, p.radius * 0.85, 0, 0, Math.PI * 2);
         ctx.fill();
       }
 
@@ -1681,12 +2385,20 @@ export class GameEngine {
     ctx.arc(this.playerX, this.playerY, this.playerStats.magnetRadius, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Dash trail effect
+    // Dash afterimage trail effect
     if (this.isDashing) {
-      ctx.fillStyle = 'rgba(6, 182, 212, 0.4)';
+      ctx.fillStyle = this.hero.avatarColor;
+      ctx.globalAlpha = 0.35;
       ctx.beginPath();
-      ctx.arc(this.playerX - this.playerVx * 0.04, this.playerY - this.playerVy * 0.04, this.playerRadius, 0, Math.PI * 2);
+      ctx.arc(
+        this.playerX - this.playerVx * 0.04,
+        this.playerY - this.playerVy * 0.04,
+        this.playerRadius,
+        0,
+        Math.PI * 2
+      );
       ctx.fill();
+      ctx.globalAlpha = 1.0;
     }
 
     // Invulnerability blink
@@ -1695,26 +2407,33 @@ export class GameEngine {
       return;
     }
 
-    // Player body
+    ctx.translate(this.playerX, this.playerY);
+    ctx.rotate(this.playerFacing);
+
+    // Outer tactical energy halo
+    ctx.strokeStyle = this.hero.avatarColor;
+    ctx.lineWidth = 2;
     ctx.shadowColor = this.hero.avatarColor;
-    ctx.shadowBlur = 14;
+    ctx.shadowBlur = 16;
+    ctx.beginPath();
+    ctx.arc(0, 0, this.playerRadius + 3, -Math.PI * 0.7, Math.PI * 0.7);
+    ctx.stroke();
+
+    // Armored operative chassis
     ctx.fillStyle = this.hero.avatarColor;
     ctx.beginPath();
-    ctx.arc(this.playerX, this.playerY, this.playerRadius, 0, Math.PI * 2);
+    ctx.arc(0, 0, this.playerRadius, 0, Math.PI * 2);
     ctx.fill();
 
-    // Facing direction pointer
-    const pointerX = this.playerX + Math.cos(this.playerFacing) * (this.playerRadius + 4);
-    const pointerY = this.playerY + Math.sin(this.playerFacing) * (this.playerRadius + 4);
+    // Inner dark titanium cockpit & glowing visor
+    ctx.fillStyle = '#090d16';
+    ctx.beginPath();
+    ctx.arc(-2, 0, this.playerRadius * 0.58, 0, Math.PI * 2);
+    ctx.fill();
+
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
-    ctx.arc(pointerX, pointerY, 4, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Player core icon
-    ctx.fillStyle = '#0f172a';
-    ctx.beginPath();
-    ctx.arc(this.playerX, this.playerY, this.playerRadius * 0.45, 0, Math.PI * 2);
+    ctx.roundRect(4, -5, 11, 10, 3);
     ctx.fill();
 
     ctx.restore();

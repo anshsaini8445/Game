@@ -7,6 +7,9 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { GameEngine } from './game/engine.ts';
 import { HEROES } from './game/constants.ts';
 import {
+  DailyMission,
+  ExclusiveRelicDef,
+  ExclusiveRelicId,
   GameRunStats,
   GameScreen,
   HeroDef,
@@ -34,6 +37,12 @@ export default function App() {
   // End run stats
   const [runStats, setRunStats] = useState<GameRunStats | null>(null);
 
+  // Mission completion notification banner
+  const [missionBanner, setMissionBanner] = useState<{
+    mission: DailyMission;
+    unlockedRelics: ExclusiveRelicDef[];
+  } | null>(null);
+
   // HUD stats state
   const [hudStats, setHudStats] = useState<{
     hp: number;
@@ -43,11 +52,15 @@ export default function App() {
     xpToNext: number;
     time: number;
     kills: number;
+    threatMultiplier?: number;
+    threatTier?: string;
     weapons: { id: WeaponId; level: number }[];
     passives: { id: PassiveId; level: number }[];
     dashReady: boolean;
     dashCooldownProgress: number;
     boss?: { name: string; hp: number; maxHp: number };
+    missions?: DailyMission[];
+    equippedRelic?: ExclusiveRelicId | null;
   }>({
     hp: 100,
     maxHp: 100,
@@ -56,10 +69,14 @@ export default function App() {
     xpToNext: 10,
     time: 0,
     kills: 0,
+    threatMultiplier: 1.0,
+    threatTier: 'STABLE',
     weapons: [{ id: 'pulse_carbine', level: 1 }],
     passives: [],
     dashReady: true,
     dashCooldownProgress: 1,
+    missions: [],
+    equippedRelic: null,
   });
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -68,6 +85,7 @@ export default function App() {
   // Start new game run
   const startGame = useCallback((heroId: HeroId) => {
     setSelectedHeroId(heroId);
+    setMissionBanner(null);
     setScreen('PLAYING');
 
     setTimeout(() => {
@@ -90,6 +108,12 @@ export default function App() {
         onVictory: (stats) => {
           setRunStats(stats);
           setScreen('VICTORY');
+        },
+        onMissionComplete: (mission, unlockedRelics) => {
+          setMissionBanner({ mission, unlockedRelics });
+          setTimeout(() => {
+            setMissionBanner((cur) => (cur?.mission.id === mission.id ? null : cur));
+          }, 4200);
         },
         onStatsUpdate: (stats) => {
           setHudStats(stats);
@@ -196,6 +220,7 @@ export default function App() {
           <GameHUD
             stats={hudStats}
             hero={hero}
+            missionBanner={missionBanner}
             onPause={handlePause}
             isMuted={isMuted}
             onToggleMute={handleToggleMute}

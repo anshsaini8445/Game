@@ -135,6 +135,17 @@ export const GameOverModal: React.FC<GameOverModalProps> = ({ stats, onRestart, 
           </div>
         </div>
 
+        {stats.missionsCompletedThisRun && stats.missionsCompletedThisRun.length > 0 && (
+          <div className="w-full p-3 rounded-xl bg-emerald-950/30 border border-emerald-500/40 mb-5 text-left font-mono text-xs">
+            <div className="text-emerald-400 font-bold mb-1">
+              DAILY BOUNTIES COMPLETED (+{stats.bonusXpEarnedThisRun || 0} BONUS XP)
+            </div>
+            <div className="text-slate-300 text-[11px]">
+              {stats.missionsCompletedThisRun.join(' · ')}
+            </div>
+          </div>
+        )}
+
         {/* Primary CTA Buttons */}
         <div className="flex flex-col gap-2 w-full">
           <button
