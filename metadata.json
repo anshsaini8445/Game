@@ -1,0 +1,8 @@
+{
+  "name": "Neon Vanguard: Horde Survivor",
+  "description": "An adrenaline-fueled sci-fi roguelite survival game. Battle endless alien hordes, build devastating weapon combos, unlock heroes, and survive the swarm.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
